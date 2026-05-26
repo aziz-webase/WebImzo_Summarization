@@ -8,8 +8,10 @@ import time
 import warnings
 import os
 
+from typing import Optional
+
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 
 warnings.filterwarnings("ignore")
@@ -119,44 +121,79 @@ def detect_language(text: str) -> str:
     return 'uz'
 
 # ============================================================
+# 4.1 Language Code Mapping
+# ============================================================
+# Optional `language` param in the API maps to a prompt language.
+# Nothing / unknown code -> default Uzbek (Latin).
+#   1 -> ru (Russian)
+#   2 -> uz_cyrl (Uzbek Cyrillic)
+#   3 -> uz_latn (Uzbek Latin)
+#   4 -> en (English)
+DEFAULT_LANG = "uz_latn"
+LANG_MAP = {
+    1: "ru",
+    2: "uz_cyrl",
+    3: "uz_latn",
+    4: "en",
+}
+
+def resolve_language(code: Optional[int]) -> str:
+    if code is None:
+        return DEFAULT_LANG
+    return LANG_MAP.get(code, DEFAULT_LANG)
+
+# ============================================================
 # 5. Prompt Builder
 # ============================================================
 def build_prompt(text, lang):
     prompts = {
-    "uz": f"""Quyidagi matnni yaxlit, tugallangan tarzda qisqa xulosa qilib yozing. 
-Matnning uzunligiga qarab xulosa hajmini tanlang: 
+    "uz_latn": f"""Quyidagi matnni yaxlit, tugallangan tarzda qisqa xulosa qilib yozing.
+Xulosani faqat o‘zbek tilida, lotin alifbosida yozing.
+Matnning uzunligiga qarab xulosa hajmini tanlang:
 - qisqa matnlar uchun 3–5 gap,
 - o‘rta hajmdagi matnlar uchun 5–7 gap,
-- katta hajmdagi matnlar uchun 7–10 gap yoki 2–3 paragraf yozing. 
+- katta hajmdagi matnlar uchun 7–10 gap yoki 2–3 paragraf yozing.
 
-Hech qachon jumlani yarimta qoldirmang. 
-Sanalarni va faktlarni matnda qanday berilgan bo‘lsa, o‘sha holatda saqlang. 
+Hech qachon jumlani yarimta qoldirmang.
+Sanalarni va faktlarni matnda qanday berilgan bo‘lsa, o‘sha holatda saqlang.
 Agar sanalarda yoki faktlarda qarama-qarshilik bo‘lsa, uni izohlamang va tuzatmang — faqat matndagi variantni xulosa qiling.
 Matn:\n\n{text}\n\n📑 Xulosa:""",
-    
-    "ru": f"""Напишите краткое резюме следующего текста. 
-Длина резюме должна зависеть от объёма текста: 
+
+    "uz_cyrl": f"""Қуйидаги матнни яхлит, тугалланган тарзда қисқа хулоса қилиб ёзинг.
+Хулосани фақат ўзбек тилида, кирилл алифбосида ёзинг.
+Матннинг узунлигига қараб хулоса ҳажмини танланг:
+- қисқа матнлар учун 3–5 гап,
+- ўрта ҳажмдаги матнлар учун 5–7 гап,
+- катта ҳажмдаги матнлар учун 7–10 гап ёки 2–3 параграф ёзинг.
+
+Ҳеч қачон жумлани яримта қолдирманг.
+Саналарни ва фактларни матнда қандай берилган бўлса, ўша ҳолатда сақланг.
+Агар саналарда ёки фактларда қарама-қаршилик бўлса, уни изоҳламанг ва тузатманг — фақат матндаги вариантни хулоса қилинг.
+Матн:\n\n{text}\n\n📑 Хулоса:""",
+
+    "ru": f"""Напишите краткое резюме следующего текста.
+Длина резюме должна зависеть от объёма текста:
 - для коротких текстов — 3–5 предложений,
 - для средних — 5–7 предложений,
-- для больших документов — 7–10 предложений или 2–3 абзаца. 
+- для больших документов — 7–10 предложений или 2–3 абзаца.
 
-Закончите резюме полной фразой. 
-Все даты и факты приводите строго в том виде, как они указаны в тексте, без изменений. 
+Закончите резюме полной фразой.
+Все даты и факты приводите строго в том виде, как они указаны в тексте, без изменений.
 Если в тексте есть противоречия в датах или фактах, не исправляйте и не поясняйте их — просто используйте то, что дано в тексте.
 \n\n{text}\n\nРезюме:""",
-    
-    "en": f"""Write a summary of the following text. 
-The length of the summary should depend on the size of the text: 
+
+    "en": f"""Write a summary of the following text.
+The length of the summary should depend on the size of the text:
 - for short texts — 3–5 sentences,
 - for medium texts — 5–7 sentences,
-- for large documents — 7–10 sentences or 2–3 paragraphs. 
+- for large documents — 7–10 sentences or 2–3 paragraphs.
 
-Make sure the summary ends with a complete sentence. 
-Preserve all dates and facts exactly as they appear in the text, without modification. 
+Make sure the summary ends with a complete sentence.
+Preserve all dates and facts exactly as they appear in the text, without modification.
 If there are inconsistencies in dates or facts, do not explain or correct them — just summarize the text as it is.
 \n\n{text}\n\nSummary:"""
 }
-    return prompts.get(lang, prompts["uz"])
+    return prompts.get(lang, prompts[DEFAULT_LANG])
 
 # ============================================================
 # 6. Text Generation
@@ -189,7 +226,7 @@ def generate_summary(prompt, max_tokens=400):
 # ============================================================
 def clean_summary(summary: str) -> str:
     # Remove prompt markers if present
-    for marker in ["Xulosa:", "Summary:", "Резюме:"]:
+    for marker in ["Xulosa:", "Хулоса:", "Summary:", "Резюме:"]:
         if marker in summary:
             summary = summary.split(marker)[-1].strip()
 
@@ -318,7 +355,10 @@ async def custom_swagger_ui():
 #    })
 
 @app.post("/ai/summarize-file")
-async def summarize_file(file: UploadFile = File(...)):
+async def summarize_file(
+    file: UploadFile = File(...),
+    language: Optional[int] = Form(None),
+):
     start_time = time.time()
 
     # Validate file type
@@ -346,10 +386,11 @@ async def summarize_file(file: UploadFile = File(...)):
     # Extract key sections to reduce processing time
     # This is crucial for performance - reduces text from 50000 to 5000 chars
     processed_text = extract_key_sections(text, max_chars=5000)
-    
-    # Detect language on the processed text for better accuracy
-    lang = detect_language(processed_text)
-    
+
+    # Resolve summary language from the optional `language` code.
+    # No code (or unknown) -> default Uzbek (Latin).
+    lang = resolve_language(language)
+
     # Build prompt with the extracted key sections
     prompt = build_prompt(processed_text, lang)
     
