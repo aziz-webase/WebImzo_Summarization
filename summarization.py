@@ -1,82 +1,36 @@
-import torch
 import fitz  # PyMuPDF
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
-from langdetect import DetectorFactory
-import gc
 import docx
 import time
-import warnings
 import os
-
+import httpx
 from typing import Optional
-
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
-
-warnings.filterwarnings("ignore")
-
-# ============================================================
-# 1. GPU / VRAM Optimization
-# ============================================================
-def clear_memory():
-    gc.collect()
-    torch.cuda.empty_cache()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-clear_memory()
+from langdetect import DetectorFactory
+from diagnoze_analizer import DialogueAnalyzer
+DetectorFactory.seed = 0
 
 # ============================================================
-# 2. Model Load (Gemma-27B IT Optimized)
+# 1. Konfiguratsiya
 # ============================================================
-model_id = "google/gemma-3-27b-it"
+VLLM_API_URL = "http://localhost:8008/v1/chat/completions"
+#VLLM_API_URL = "http://vllm-server:8000/v1/chat/completions"
+MODEL_ID = "cyankiwi/gemma-4-31B-it-AWQ-4bit"
+ihma_analyzer = DialogueAnalyzer(model=MODEL_ID,api_url=VLLM_API_URL)
 
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-)
-
-print("🔄 Model yuklanmoqda...")
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    quantization_config=bnb_config,
-    torch_dtype=torch.bfloat16,
-    low_cpu_mem_usage=True,
-    attn_implementation="sdpa"
-)
-
-tokenizer = AutoTokenizer.from_pretrained(
-    model_id,
-    use_fast=True,
-    padding_side="left"
-)
-
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-pipe = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    return_full_text=False,
-    batch_size=1
-)
-print("✅ Model yuklandi!")
+app = FastAPI(title="⚡ vLLM Summarizer API", version="1.0.0")
 
 # ============================================================
-# 3. File Reader (PDF + DOCX)
+# 2. Fayl O'qish (Avvalgi kodingizdan)
 # ============================================================
-def read_file(file_path, max_pages=50, max_chars=100000):
+def read_file(file_path, max_pages=20, max_chars=50000):
     try:
         if file_path.endswith(".pdf"):
             doc = fitz.open(file_path)
             text_parts, total_chars = [], 0
             for i in range(min(len(doc), max_pages)):
-                if total_chars >= max_chars:
-                    break
+                if total_chars >= max_chars: break
                 page_text = doc[i].get_text("text", flags=11)
                 if page_text.strip():
                     text_parts.append(page_text)
@@ -87,48 +41,35 @@ def read_file(file_path, max_pages=50, max_chars=100000):
             doc = docx.Document(file_path)
             text_parts, total_chars = [], 0
             for para in doc.paragraphs:
-                if total_chars >= max_chars:
-                    break
+                if total_chars >= max_chars: break
                 if para.text.strip():
                     text_parts.append(para.text.strip())
                     total_chars += len(para.text)
             text = " ".join(text_parts)
         else:
-            return None, "❌ Faqat PDF yoki DOCX qo‘llab-quvvatlanadi"
+            return None, "❌ Faqat PDF yoki DOCX qo'llab-quvvatlanadi"
         
-        text = " ".join(text.split())
-        return text[:max_chars].strip(), None
+        return " ".join(text.split())[:max_chars].strip(), None
     except Exception as e:
-        return None, f"❌ Fayl o‘qishda xatolik: {e}"
-
-# ============================================================
-# 4. Language Detection
-# ============================================================
-DetectorFactory.seed = 0
+        return None, f"❌ Fayl o'qishda xatolik: {e}"
 
 def detect_language(text: str) -> str:
     sample = text[:1000]
-    if any(c in sample for c in ['ў', 'ғ', 'ҳ', 'қ']):
-        return 'uz'
-    if sum(1 for w in [' va ', ' bilan ', ' uchun '] if w in sample.lower()) >= 2:
-        return 'uz'
-    if any(c in sample for c in ['ы', 'э', 'ё', 'щ']):
-        return 'ru'
-    if sum(1 for w in [' и ', ' в ', ' на '] if w in sample.lower()) >= 2:
-        return 'ru'
-    if sum(1 for w in [' the ', ' is ', ' and '] if w in sample.lower()) >= 2:
-        return 'en'
+    if any(c in sample for c in ['ў', 'ғ', 'ҳ', 'қ']): return 'uz'
+    if sum(1 for w in [' va ', ' bilan ', ' uchun '] if w in sample.lower()) >= 2: return 'uz'
+    if any(c in sample for c in ['ы', 'э', 'ё', 'щ']): return 'ru'
+    if sum(1 for w in [' и ', ' в ', ' на '] if w in sample.lower()) >= 2: return 'ru'
+    if sum(1 for w in [' the ', ' is ', ' and '] if w in sample.lower()) >= 2: return 'en'
     return 'uz'
 
 # ============================================================
-# 4.1 Language Code Mapping
+# Til kodi mapping (ixtiyoriy `language` parami uchun)
 # ============================================================
-# Optional `language` param in the API maps to a prompt language.
-# Nothing / unknown code -> default Uzbek (Latin).
-#   1 -> ru (Russian)
-#   2 -> uz_cyrl (Uzbek Cyrillic)
-#   3 -> uz_latn (Uzbek Latin)
-#   4 -> en (English)
+# Hech narsa yuborilmasa / noma'lum kod -> default o'zbek (lotin).
+#   1 -> ru (rus)
+#   2 -> uz_cyrl (o'zbek kirill)
+#   3 -> uz_latn (o'zbek lotin)
+#   4 -> en (ingliz)
 DEFAULT_LANG = "uz_latn"
 LANG_MAP = {
     1: "ru",
@@ -142,217 +83,59 @@ def resolve_language(code: Optional[int]) -> str:
         return DEFAULT_LANG
     return LANG_MAP.get(code, DEFAULT_LANG)
 
-# ============================================================
-# 5. Prompt Builder
-# ============================================================
-def build_prompt(text, lang):
-    prompts = {
-    "uz_latn": f"""Quyidagi matnni yaxlit, tugallangan tarzda qisqa xulosa qilib yozing.
-Xulosani faqat o‘zbek tilida, lotin alifbosida yozing.
-Matnning uzunligiga qarab xulosa hajmini tanlang:
-- qisqa matnlar uchun 3–5 gap,
-- o‘rta hajmdagi matnlar uchun 5–7 gap,
-- katta hajmdagi matnlar uchun 7–10 gap yoki 2–3 paragraf yozing.
-
-Hech qachon jumlani yarimta qoldirmang.
-Sanalarni va faktlarni matnda qanday berilgan bo‘lsa, o‘sha holatda saqlang.
-Agar sanalarda yoki faktlarda qarama-qarshilik bo‘lsa, uni izohlamang va tuzatmang — faqat matndagi variantni xulosa qiling.
-Matn:\n\n{text}\n\n📑 Xulosa:""",
-
-    "uz_cyrl": f"""Қуйидаги матнни яхлит, тугалланган тарзда қисқа хулоса қилиб ёзинг.
-Хулосани фақат ўзбек тилида, кирилл алифбосида ёзинг.
-Матннинг узунлигига қараб хулоса ҳажмини танланг:
-- қисқа матнлар учун 3–5 гап,
-- ўрта ҳажмдаги матнлар учун 5–7 гап,
-- катта ҳажмдаги матнлар учун 7–10 гап ёки 2–3 параграф ёзинг.
-
-Ҳеч қачон жумлани яримта қолдирманг.
-Саналарни ва фактларни матнда қандай берилган бўлса, ўша ҳолатда сақланг.
-Агар саналарда ёки фактларда қарама-қаршилик бўлса, уни изоҳламанг ва тузатманг — фақат матндаги вариантни хулоса қилинг.
-Матн:\n\n{text}\n\n📑 Хулоса:""",
-
-    "ru": f"""Напишите краткое резюме следующего текста.
-Длина резюме должна зависеть от объёма текста:
-- для коротких текстов — 3–5 предложений,
-- для средних — 5–7 предложений,
-- для больших документов — 7–10 предложений или 2–3 абзаца.
-
-Закончите резюме полной фразой.
-Все даты и факты приводите строго в том виде, как они указаны в тексте, без изменений.
-Если в тексте есть противоречия в датах или фактах, не исправляйте и не поясняйте их — просто используйте то, что дано в тексте.
-\n\n{text}\n\nРезюме:""",
-
-    "en": f"""Write a summary of the following text.
-The length of the summary should depend on the size of the text:
-- for short texts — 3–5 sentences,
-- for medium texts — 5–7 sentences,
-- for large documents — 7–10 sentences or 2–3 paragraphs.
-
-Make sure the summary ends with a complete sentence.
-Preserve all dates and facts exactly as they appear in the text, without modification.
-If there are inconsistencies in dates or facts, do not explain or correct them — just summarize the text as it is.
-\n\n{text}\n\nSummary:"""
-}
-    return prompts.get(lang, prompts[DEFAULT_LANG])
-
-# ============================================================
-# 6. Text Generation
-# ============================================================
-def generate_summary(prompt, max_tokens=400):
-    try:
-        with torch.inference_mode():
-            output = pipe(
-                prompt,
-                max_new_tokens=max_tokens,
-                min_new_tokens=50,
-                temperature=0.3,
-                do_sample=False,
-                top_p=0.9,
-                top_k=20,
-                repetition_penalty=1.1,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                num_beams=1,
-                early_stopping=True,
-                use_cache=True
-            )
-        text = output[0]["generated_text"].strip()
-        return text
-    except Exception as e:
-        return f"❌ Generation xatosi: {e}"
-
-# ============================================================
-# 7. Post-processing (Ensure full sentence)
-# ============================================================
-def clean_summary(summary: str) -> str:
-    # Remove prompt markers if present
-    for marker in ["Xulosa:", "Хулоса:", "Summary:", "Резюме:"]:
-        if marker in summary:
-            summary = summary.split(marker)[-1].strip()
-
-    # Ensure summary ends with full stop, question mark, or exclamation
-    if not summary.endswith((".", "!", "?")):
-        last_dot = max(summary.rfind("."), summary.rfind("!"), summary.rfind("?"))
-        if last_dot != -1:
-            summary = summary[: last_dot + 1].strip()
-    return summary
-
 def extract_key_sections(text, max_chars=5000):
-    """Extract introduction, middle, and conclusion for better summaries"""
     text_len = len(text)
-    if text_len <= max_chars:
-        return text
-    
-    # Take intro (30%), middle sample (40%), conclusion (30%)
+    if text_len <= max_chars: return text
     intro_size = int(max_chars * 0.3)
     middle_size = int(max_chars * 0.4)
     conclusion_size = int(max_chars * 0.3)
-    
     intro = text[:intro_size]
     middle_start = (text_len // 2) - (middle_size // 2)
     middle = text[middle_start:middle_start + middle_size]
     conclusion = text[-conclusion_size:]
-    
     return f"{intro} ... {middle} ... {conclusion}"
 
 # ============================================================
-# 8. FastAPI App
+# 3. vLLM ga so'rov yuborish (YANGI QISM)
 # ============================================================
-app = FastAPI(title="⚡ Summarizer API", version="0.1.0")
+async def generate_summary_vllm(text, lang):
+    system_prompts = {
+        "uz_latn": "Sen professional matn xulosa qiluvchi yordamchisan. Asosiy faktlarni yo'qotmagan holda, aniq va lo'nda xulosa yozishing kerak. Javobni faqat o'zbek tilida, lotin alifbosida yoz.",
+        "uz_cyrl": "Сен профессионал матн хулоса қилувчи ёрдамчисан. Асосий фактларни йўқотмаган ҳолда, аниқ ва лўнда хулоса ёзишинг керак. Жавобни фақат ўзбек тилида, кирилл алифбосида ёз.",
+        "ru": "Вы профессиональный ИИ-ассистент для создания резюме текстов. Ваша задача — писать точные и краткие выводы, сохраняя факты.",
+        "en": "You are a professional AI text summarizer. You must write clear and concise summaries while preserving key facts."
+    }
 
-@app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui():
-    return get_swagger_ui_html(
-        openapi_url="https://webimzo.uz/openapi.json",
-        title="My API Docs"
-        # boshqa parametrlar ham joylashtirilishi mumkin
-    )
+    user_prompts = {
+        "uz_latn": f"Quyidagi matnni hajmiga qarab 3-10 ta gap bilan xulosa qilib ber. Xulosani lotin alifbosida yoz. Matn:\n\n{text}",
+        "uz_cyrl": f"Қуйидаги матнни ҳажмига қараб 3-10 та гап билан хулоса қилиб бер. Хулосани кирилл алифбосида ёз. Матн:\n\n{text}",
+        "ru": f"Сделайте краткое резюме следующего текста (от 3 до 10 предложений в зависимости от длины). Текст:\n\n{text}",
+        "en": f"Summarize the following text in 3 to 10 sentences depending on its length. Text:\n\n{text}"
+    }
 
+    payload = {
+        "model": MODEL_ID,
+        "messages": [
+            {"role": "system", "content": system_prompts.get(lang, system_prompts[DEFAULT_LANG])},
+            {"role": "user", "content": user_prompts.get(lang, user_prompts[DEFAULT_LANG])}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 400,
+        "top_p": 0.9
+    }
+
+    # vLLM ga so'rov yuborish
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(VLLM_API_URL, json=payload)
+        result = response.json()
+        return result['choices'][0]['message']['content']
+
+# ============================================================
+# 4. API Endpointlar
+# ============================================================
 @app.get("/ai/docs", include_in_schema=False)
 async def custom_swagger_ui():
-    return get_swagger_ui_html(
-        openapi_url="https://webimzo.uz/openapi.json",
-        title="My API Docs"
-        # boshqa parametrlar ham joylashtirilishi mumkin
-    )
-
-#@app.post("/summarize-file")
-#async def summarize_file(file: UploadFile = File(...)):
-#    start_time = time.time()
-
-#    if not (file.filename.endswith(".pdf") or file.filename.endswith(".docx")):
-#        raise HTTPException(status_code=400, detail="Faqat PDF yoki DOCX qo‘llab-quvvatlanadi")
-    
-#    temp_path = f"/tmp/{file.filename}"
-#    with open(temp_path, "wb") as f:
-#        f.write(await file.read())
-
-#    text, error = read_file(temp_path, max_pages=8, max_chars=8000)
-#    os.remove(temp_path)
-
-#    if error:
-#        raise HTTPException(status_code=500, detail=error)
-#    if not text or len(text) < 50:
-#        raise HTTPException(status_code=400, detail="Fayl bo‘sh yoki juda qisqa")
-
-#    lang = detect_language(text)
-#    word_count = len(text.split())
-#    prompt = build_prompt(text, lang)
-#    summary_raw = generate_summary(prompt, max_tokens=150)
-#    summary = clean_summary(summary_raw)
-
-#    elapsed = time.time() - start_time
-#    clear_memory()
-    
-#    return JSONResponse({
-#        "success": True,
-#        "summary": summary,
-#        "language": lang,
-#        "stats": {
-#            "original_words": word_count,
-#            "summary_words": len(summary.split()),
-#            "time_seconds": round(elapsed, 2)
-#        }
-#    })
-
-
-#@app.post("/ai/summarize-file")
-#async def summarize_file(file: UploadFile = File(...)):
-#    start_time = time.time()
-
-#    if not (file.filename.endswith(".pdf") or file.filename.endswith(".docx")):
-#        raise HTTPException(status_code=400, detail="Faqat PDF yoki DOCX qo‘llab-quvvatlanadi")
-    
-#    temp_path = f"/tmp/{file.filename}"
-#    with open(temp_path, "wb") as f:
-#        f.write(await file.read())
-
-#    text, error = read_file(temp_path, max_pages=50, max_chars=100000)
-#    os.remove(temp_path)
-
-#    if error:
-#        raise HTTPException(status_code=500, detail=error)
-#    if not text or len(text) < 50:
-#        raise HTTPException(status_code=400, detail="Fayl bo‘sh yoki juda qisqa")
-#    lang = detect_language(text)
-#    word_count = len(text.split())
-#    prompt = build_prompt(text, lang)
-#    summary_raw = generate_summary(prompt, max_tokens=400)
-#    summary = clean_summary(summary_raw)
-
-#    elapsed = time.time() - start_time
-#    clear_memory()
-    
-#    return JSONResponse({
-#        "success": True,
-#        "summary": summary,
-#        "language": lang,
-#        "stats": {
-#            "original_words": word_count,
-#            "summary_words": len(summary.split()),
-#            "time_seconds": round(elapsed, 2)
-#        }
-#    })
+    return get_swagger_ui_html(openapi_url="/openapi.json", title="Summarizer API Docs")
 
 @app.post("/ai/summarize-file")
 async def summarize_file(
@@ -361,58 +144,91 @@ async def summarize_file(
 ):
     start_time = time.time()
 
-    # Validate file type
     if not (file.filename.endswith(".pdf") or file.filename.endswith(".docx")):
         raise HTTPException(status_code=400, detail="Faqat PDF yoki DOCX qo'llab-quvvatlanadi")
     
-    # Save uploaded file temporarily
     temp_path = f"/tmp/{file.filename}"
     with open(temp_path, "wb") as f:
         f.write(await file.read())
 
-    # Read file with reduced limits for initial speed boost
-    # Reduce max_pages to 20 and max_chars to 50000 for faster processing
     text, error = read_file(temp_path, max_pages=20, max_chars=50000)
     os.remove(temp_path)
 
-    if error:
-        raise HTTPException(status_code=500, detail=error)
-    if not text or len(text) < 50:
-        raise HTTPException(status_code=400, detail="Fayl bo'sh yoki juda qisqa")
+    if error: raise HTTPException(status_code=500, detail=error)
+    if not text or len(text) < 50: raise HTTPException(status_code=400, detail="Fayl bo'sh yoki juda qisqa")
     
-    # Store original metrics
     original_word_count = len(text.split())
-    
-    # Extract key sections to reduce processing time
-    # This is crucial for performance - reduces text from 50000 to 5000 chars
     processed_text = extract_key_sections(text, max_chars=5000)
-
-    # Resolve summary language from the optional `language` code.
-    # No code (or unknown) -> default Uzbek (Latin).
+    # Xulosa tili ixtiyoriy `language` kodidan aniqlanadi.
+    # Hech narsa yuborilmasa / noma'lum kod -> default o'zbek (lotin).
     lang = resolve_language(language)
 
-    # Build prompt with the extracted key sections
-    prompt = build_prompt(processed_text, lang)
-    
-    # Generate summary with optimized parameters
-    summary_raw = generate_summary(prompt, max_tokens=300)  # Reduced from 400
-    summary = clean_summary(summary_raw)
+    # ⚡ VLLM orqali ultra-tez generatsiya
+    summary = await generate_summary_vllm(processed_text, lang)
 
-    # Calculate processing time
     elapsed = time.time() - start_time
-    
-    # Clear GPU memory
-    clear_memory()
     
     return JSONResponse({
         "success": True,
         "summary": summary,
         "language": lang,
         "stats": {
-#            "original_words": original_word_count,
-#            "processed_chars": len(processed_text),
+            "original_words": original_word_count,
             "summary_words": len(summary.split()),
-            "compression_ratio": round(original_word_count / len(summary.split()), 2),
             "time_seconds": round(elapsed, 2)
         }
     })
+
+
+@app.post("/ai/ihma-summary")
+async def ihma_summary_endpoint(file: UploadFile = File(...)):
+    """
+    Siz taqdim etgan DialogueAnalyzer klassi orqali 
+    dialoglarni chuqur tahlil qilish (vazifalar, qarorlar, statistika).
+    """
+    start_time = time.time()
+    
+    # Faylni vaqtincha saqlash
+    temp_path = f"/tmp/ihma_{file.filename}"
+    with open(temp_path, "wb") as f:
+        f.write(await file.read())
+
+    try:
+        # 1. Ma'lumotni yuklash
+        # DialogueAnalyzer.load_dialogue_data metodidan foydalanamiz
+        dialogue_data = ihma_analyzer.load_dialogue_data(temp_path)
+        print(dialogue_data)        
+        # Agar bu oddiy matn bo'lsa (JSON bo'lmasa), klass ichidagi mantiqni hisobga olib
+        # uni dialog formatiga o'tkazishga harakat qilamiz
+        if not dialogue_data or 'dialogue' not in dialogue_data:
+            content, error = read_file(temp_path)
+            if error: raise HTTPException(status_code=400, detail=error)
+            # Oddiy matnni bitta spikerli dialog sifatida o'raymiz
+            dialogue_data = {
+                "success": True,
+                "dialogue": [{"speaker": "User", "text": content, "start": 0, "end": 10}],
+                "filename": file.filename
+            }
+
+        # 2. DialogueAnalyzer orqali tahlil qilish
+        # Bu metod ichida: xulosa, sentiment, mavzular, qarorlar va vazifalar bor
+        analysis_results = ihma_analyzer.analyze_dialogue(dialogue_data)
+        
+        if 'error' in analysis_results:
+            raise HTTPException(status_code=500, detail=analysis_results['error'])
+
+        elapsed = time.time() - start_time
+        
+        # 3. Natijani qaytarish
+        return JSONResponse({
+            "success": True,
+            "processing_time": round(elapsed, 2),
+            "data": analysis_results
+        })
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Tahlil jarayonida xatolik: {str(e)}")
+    
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
